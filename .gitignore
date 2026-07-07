@@ -8,6 +8,9 @@ venv/
 # mounted volume if this ever runs in Docker).
 caller.db
 
+# Cron sweep logs
+*.log
+
 # Python artifacts
 __pycache__/
 *.pyc
