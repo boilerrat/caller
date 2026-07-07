@@ -175,16 +175,26 @@ def cmd_metaculus(args, cfg) -> None:
     client = _make_client(cfg)
     questions = client.list_open_binary(args.tournament)
 
-    fresh = [q for q in questions if not q.already_forecasted]
-    skipped = len(questions) - len(fresh)
+    # The list response doesn't reliably carry forecast state, so each
+    # candidate needs a detail check — done lazily, stopping once the sweep
+    # limit is filled so a big tournament doesn't mean dozens of extra GETs.
+    limit = args.limit or len(questions)
+    fresh, skipped = [], 0
+    for mq in questions:
+        if len(fresh) >= limit:
+            break
+        if mq.already_forecasted or client.already_forecasted(mq.post_id):
+            skipped += 1
+            continue
+        fresh.append(mq)
+
     if skipped:
         print(f"Skipping {skipped} question(s) already forecasted.")
     if not fresh:
         print(f"No open unforecasted binary questions in '{args.tournament}'.")
         return
-    if args.limit and len(fresh) > args.limit:
-        print(f"Limiting to {args.limit} of {len(fresh)} open questions.")
-        fresh = fresh[: args.limit]
+    if len(questions) > len(fresh) + skipped:
+        print(f"Limiting to {len(fresh)} of {len(questions)} open questions.")
 
     book = ledger.Ledger(cfg.db_path)
     failures = []

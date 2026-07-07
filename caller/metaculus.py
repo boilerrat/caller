@@ -148,6 +148,24 @@ class MetaculusClient:
             )
         return questions
 
+    def already_forecasted(self, post_id: int) -> bool:
+        """Whether this bot account has a standing forecast on the post.
+
+        The /posts/ *list* response returns my_forecasts as null regardless
+        of forecast state (verified live) — only the per-post detail endpoint
+        populates it. So dedup requires one extra GET per candidate; the CLI
+        checks lazily, only until its sweep limit is filled.
+        """
+        resp = requests.get(
+            f"{API_BASE_URL}/posts/{post_id}/",
+            headers=self.headers,
+            timeout=30,
+        )
+        self._check(resp, f"detail fetch for post {post_id}")
+        question = resp.json().get("question") or {}
+        latest = (question.get("my_forecasts") or {}).get("latest") or {}
+        return bool(latest.get("forecast_values"))
+
     # --- writes -----------------------------------------------------------
 
     def submit(self, question_id: int, probability: float) -> None:

@@ -28,6 +28,7 @@ set -a; source .env; set +a
 |----------|----------|---------|-------------|
 | `ANTHROPIC_API_KEY` | Yes (live mode) | — | Anthropic API key for the reasoning model |
 | `TAVILY_API_KEY` | Yes (live mode) | — | Tavily key for the research phase |
+| `METACULUS_TOKEN` | For `metaculus` only | — | Bot-account token from [metaculus.com/aib](https://www.metaculus.com/aib/) |
 | `CALLER_MODEL` | No | `claude-sonnet-4-6` | Model used for reasoning and formalization |
 | `CALLER_QUERY_MODEL` | No | `claude-haiku-4-5` | Cheap model for search-query generation |
 | `CALLER_RUNS` | No | `5` | Reasoning runs aggregated per forecast |
@@ -83,6 +84,39 @@ python -m caller score                     # mean Brier across resolved question
 
 A Brier score of 0.25 is coin-flipping; sustained scores in the 0.10–0.15 range on a real question mix indicate genuine forecasting skill. Build a resolved track record here before any capital decision depends on this bot's output.
 
+## Metaculus tournaments
+
+The `metaculus` subcommand runs the full pipeline against open binary
+questions in a tournament and submits the median forecast plus a private
+rationale comment through the Metaculus API. Questions the bot has already
+forecasted are skipped, every submission is recorded in the local ledger
+with a link back to the Metaculus question, and one failed question never
+aborts the rest of a sweep. Metaculus questions arrive with resolution
+criteria already pinned down, so no formalization pass is needed on this
+path.
+
+```bash
+# Sandbox first — validate end-to-end without touching a live tournament:
+python -m caller metaculus --tournament bot-testing-area --dry-run --limit 1
+
+# --dry-run runs research + reasoning but submits and records nothing.
+# Drop it to submit for real; then point at a live tournament:
+python -m caller metaculus --tournament minibench --limit 5
+```
+
+`--limit` (default 5) caps spend — each question costs one query-generation
+call, ~6 searches, and N reasoning runs. `--mock` exercises the plumbing
+offline and always implies `--dry-run`: a mock forecast can never reach a
+live tournament.
+
+To forecast on a schedule, a crontab entry is all it takes (no
+containerization needed while running on one machine):
+
+```cron
+# Sweep MiniBench four times a day, keeping a log:
+0 */6 * * * cd /path/to/caller && set -a; . ./.env; set +a; venv/bin/python -m caller metaculus --tournament minibench --limit 5 >> metaculus_cron.log 2>&1
+```
+
 ## Architecture
 
 The pipeline is five small modules, each replaceable on its own:
@@ -93,7 +127,8 @@ The pipeline is five small modules, each replaceable on its own:
 | `research.py` | Decomposes the question into 4–6 targeted search queries with one cheap LLM call (base rates, key actors, recent developments, status-quo values), runs them against a pluggable backend (`TavilyBackend`, `MockBackend`), and assembles a research digest. Falls back to fixed template queries if query generation fails — retrieval degrades gracefully, never blocks a forecast. Swap in Exa, Brave, or AskNews by implementing one method. |
 | `reasoning.py` | One structured superforecast per call: outside view (base rate) first, evidence weighing, decomposition, steelmanning, then a committed probability returned as JSON. |
 | `aggregate.py` | Median of N independent runs. Reports spread as an instability warning. |
-| `ledger.py` | SQLite record of every forecast and resolution, with per-question and mean Brier scoring. Stores the original question phrasing alongside the formalized version when they differ. |
+| `ledger.py` | SQLite record of every forecast and resolution, with per-question and mean Brier scoring. Stores the original question phrasing alongside the formalized version when they differ, and the Metaculus question id/URL for submitted tournament forecasts. |
+| `metaculus.py` | Thin client over three Metaculus API endpoints (list tournament posts, submit forecast, comment), ported from the official metac-bot-template. Deliberately not the full `forecasting-tools` framework — their endpoints, our pipeline. |
 
 `question.py` defines the question contract (text, resolution criteria, resolution date), `config.py` centralizes environment configuration, and `cli.py` wires the pipeline together.
 
@@ -113,14 +148,14 @@ lifecycle in mock mode. No API keys or network access needed.
 
 ```bash
 pip install -r requirements-dev.txt
-pytest                # 54 tests
-pytest --cov=caller   # with coverage (91%; the gaps are the live API calls)
+pytest                # 74 tests
+pytest --cov=caller   # with coverage (the gaps are the live API call bodies)
 ```
 
 ## Roadmap
 
 1. ~~**Phase 2 — better research and formalization.**~~ Done: LLM-generated sub-queries with template fallback, and the `--formalize` approval-gated question pass.
-2. **Phase 3 — Metaculus integration.** Poll the Metaculus API for open tournament questions, forecast, and submit on a schedule; containerize for Dokploy deployment.
+2. ~~**Phase 3 — Metaculus integration.**~~ Done: the `metaculus` subcommand lists open tournament questions, forecasts, submits with rationale comments, and runs fine from cron. Containerization deliberately deferred — it runs locally.
 3. **Phase 4 — publication and markets.** Publish forecasts (Farcaster frame, newsletter section) and, only after a demonstrated calibration record, evaluate market execution given jurisdictional constraints.
 
 ## License

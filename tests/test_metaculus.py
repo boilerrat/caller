@@ -121,6 +121,36 @@ def test_list_filters_non_binary_defensively(monkeypatch):
     assert [q.question_id for q in questions] == [201]
 
 
+def test_already_forecasted_reads_post_detail(monkeypatch):
+    """The list response carries my_forecasts as null (verified live), so
+    forecast-state dedup must hit the per-post detail endpoint."""
+    captured = {}
+
+    def fake_get(url, headers=None, params=None, timeout=None):
+        captured["url"] = url
+        return FakeResponse({
+            "id": 101,
+            "question": {
+                "id": 201,
+                "my_forecasts": {"latest": {"forecast_values": [0.99, 0.01]}},
+            },
+        })
+
+    monkeypatch.setattr(metaculus.requests, "get", fake_get)
+    assert MetaculusClient("t").already_forecasted(101) is True
+    assert captured["url"] == f"{API_BASE_URL}/posts/101/"
+
+
+def test_already_forecasted_false_when_no_forecast(monkeypatch):
+    monkeypatch.setattr(
+        metaculus.requests, "get",
+        lambda *a, **k: FakeResponse(
+            {"id": 101, "question": {"id": 201, "my_forecasts": None}}
+        ),
+    )
+    assert MetaculusClient("t").already_forecasted(101) is False
+
+
 # --- submission payloads ------------------------------------------------
 
 
@@ -209,6 +239,12 @@ class StubClient:
 
     def list_open_binary(self, tournament, count=50):
         return self.questions
+
+    def already_forecasted(self, post_id):
+        return any(
+            q.post_id == post_id and q.already_forecasted
+            for q in self.questions
+        )
 
     def submit(self, question_id, probability):
         self.submitted.append((question_id, probability))

@@ -26,8 +26,9 @@ Five small, independently replaceable modules, wired together by `cli.py`:
 | `caller/reasoning.py` | One structured superforecast per call. System prompt enforces the Tetlock/Good Judgment Project discipline in order: outside view (reference class + base rate) → inside view (weigh evidence) → decomposition of conjunctive events → steelman both YES and NO → commit to a precise probability. Demands strict JSON output (no markdown fences); `_parse()` tolerates stray fences, raises `ValueError` naming the offending run on malformed JSON, and clamps probability to [0.01, 0.99]. Temperature is left at default (1.0) *on purpose* — run-to-run diversity is what makes median aggregation work. `run_once_mock()` exercises the same parse path offline with a random probability in [0.30, 0.45]. |
 | `caller/aggregate.py` | `aggregate()` takes N `ForecastRun`s → median probability (robust to outlier runs, unlike mean). `AggregatedForecast.spread` = max−min across runs; >0.25 triggers a "⚠ high spread" caution in the summary — usually means the question is ambiguous or the research digest was thin. |
 | `caller/ledger.py` | SQLite store (`predictions` table). `record()` logs a forecast, keeping the rationale from whichever run's probability sits closest to the median as the "representative" rationale; optional `raw_question` records the user's original phrasing when formalization rewrote it (nullable column, auto-migrated onto pre-Phase-2 databases via a `PRAGMA table_info` check + `ALTER TABLE` in `__init__`). `resolve()` marks an outcome and computes Brier score `(probability - outcome)^2`. `calibration_summary()` reports mean Brier across resolved questions. This ledger is the non-negotiable part of the project — no capital decision should depend on the bot's output until it has a resolved track record. |
-| `caller/config.py` | All runtime config from environment variables (`ANTHROPIC_API_KEY`, `TAVILY_API_KEY`, `CALLER_MODEL`, `CALLER_QUERY_MODEL`, `CALLER_RUNS`, `CALLER_MAX_TOKENS`, `CALLER_SEARCH_RESULTS`, `CALLER_DB`) so the same code runs unchanged on a laptop, in Docker, or CI. |
-| `caller/cli.py` | argparse wiring for `forecast` (with `--formalize` and `--mock` flags), `formalize`, `resolve`, `log`, `score` subcommands. |
+| `caller/metaculus.py` | Phase 3. Thin client over three Metaculus API endpoints, ported from the official metac-bot-template (deliberately NOT the `forecasting-tools` framework, which would replace our pipeline): `GET /api/posts/` (list, filtered by tournament/open/binary), `POST /api/questions/forecast/` (payload is a JSON **array**; binary = `probability_yes`), `POST /api/comments/create/` (private rationale comment). Auth: `Authorization: Token <METACULUS_TOKEN>` (bot account from metaculus.com/aib). **Critical API gotcha, verified live: the /posts/ list response returns `my_forecasts: null` regardless of forecast state — only `GET /api/posts/{id}/` (detail) populates it.** So already-forecasted dedup goes through `client.already_forecasted(post_id)` (one detail GET), which the CLI calls lazily until the sweep `--limit` is filled. `MetaculusQuestion.to_question()` maps title/criteria/fine-print/background (truncated to 1500 chars) + `scheduled_resolve_time` into our `Question`; no formalization needed since Metaculus questions arrive pre-formalized. Tournament ids: `bot-testing-area` (sandbox), `minibench`, `33022` (Summer 2026 AI Benchmarking). |
+| `caller/config.py` | All runtime config from environment variables (`ANTHROPIC_API_KEY`, `TAVILY_API_KEY`, `METACULUS_TOKEN`, `CALLER_MODEL`, `CALLER_QUERY_MODEL`, `CALLER_RUNS`, `CALLER_MAX_TOKENS`, `CALLER_SEARCH_RESULTS`, `CALLER_DB`) so the same code runs unchanged on a laptop, in Docker, or CI. |
+| `caller/cli.py` | argparse wiring for `forecast` (with `--formalize` and `--mock` flags), `formalize`, `metaculus` (with `--tournament`, `--limit`, `--dry-run`, `--mock`; mock forces dry-run so mock forecasts can never be submitted; per-question failures don't abort the sweep; dry-run has zero side effects — no submit, no ledger row), `resolve`, `log`, `score` subcommands. `_make_client()` is the test seam for stubbing the Metaculus client. |
 
 ## Key design decisions and invariants
 
@@ -40,18 +41,20 @@ Five small, independently replaceable modules, wired together by `cli.py`:
 
 ## Testing
 
-`tests/` holds 54 pytest tests (91% coverage; the uncovered lines are the
-live API call bodies and `__main__.py`). Run with `venv/bin/pytest`; config
-in `pytest.ini` (`pythonpath = .` until a pyproject.toml exists). Everything
-deterministic is covered: both `_parse()` paths, aggregation, ledger/Brier
-math, the schema migration, query fallback, and the CLI lifecycle in mock
-mode (including the formalization approval loop via monkeypatched `input`).
-Dev deps in `requirements-dev.txt`.
+`tests/` holds 74 pytest tests (the uncovered lines are the live API call
+bodies and `__main__.py`). Run with `venv/bin/pytest`; config in
+`pytest.ini` (`pythonpath = .` until a pyproject.toml exists). Everything
+deterministic is covered: all `_parse()` paths, aggregation, ledger/Brier
+math, both schema migrations, query fallback, the CLI lifecycle in mock
+mode (including the formalization approval loop via monkeypatched `input`),
+and the Metaculus client/sweep (canned JSON shaped like the real API,
+submission payload shape pinned as a JSON array, dry-run zero-side-effects
+guarantee). Dev deps in `requirements-dev.txt`.
 
 ## Roadmap (do not start ahead of explicit approval)
 
 1. ~~**Phase 2 — better research and formalization.**~~ COMPLETE, live-validated at both gates (formalization: spread 0.30 → 0.02 on the same fuzzy question; query generation: digest 6.6k → 21k+ chars with base-rate/status-quo coverage on the same rate question).
-2. **Phase 3 — Metaculus integration.** Poll the Metaculus API for open tournament questions, forecast, submit on a schedule; Dockerize for Dokploy/Traefik deployment on the user's OVH VPS.
+2. ~~**Phase 3 — Metaculus integration.**~~ COMPLETE except deployment, live-validated in the bot-testing-area sandbox (submission + rationale comment accepted; re-sweep correctly skips). **Dockerization deliberately deferred by the user** — it runs locally, scheduled via cron (example line in README); don't propose containerizing unless asked.
 3. **Phase 4 — publication and markets.** Publish forecasts (Farcaster frame, newsletter section) and, only after a demonstrated calibration record, evaluate market execution given jurisdictional constraints.
 
 ## Working conventions (user preference — apply to all work in this repo)
@@ -65,6 +68,7 @@ Dev deps in `requirements-dev.txt`.
 
 ## Not yet true (don't assume)
 
-- No git repository yet — this is a plain directory, not `git init`'d. When it becomes one: `.gitignore` needs `venv/`, `.env`, `caller.db`, `.pytest_cache/`, `__pycache__/`; and switch to the issue-first workflow.
-- No Metaculus, Docker, or deployment configuration exists yet (Phase 3).
-- The ledger contains a few mock-mode test rows (e.g. #1, #6) mixed in with real live predictions — the user has not asked for them to be cleaned up.
+- No git repository yet — this is a plain directory, not `git init`'d (a `.gitignore` already exists, covering `venv/`, `.env`, `caller.db`, caches). When it becomes one, switch to the issue-first workflow.
+- No Docker or deployment configuration — deliberately (user's call), it runs locally.
+- No cron job is actually installed yet — only documented in the README.
+- Ledger row #14 is the sandbox (bot-testing-area) test submission — a real question resolving 2027-01-31, kept unless the user wants it removed. Mock rows were cleaned 2026-07-06.
