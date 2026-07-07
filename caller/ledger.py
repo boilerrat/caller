@@ -34,7 +34,10 @@ CREATE TABLE IF NOT EXISTS predictions (
     rationale       TEXT,              -- rationale from the run closest to median
     created_at      TEXT NOT NULL,     -- ISO timestamp
     outcome         INTEGER,           -- NULL until resolved; then 1=YES, 0=NO
-    brier           REAL               -- NULL until resolved
+    brier           REAL,              -- NULL until resolved
+    metaculus_qid   INTEGER,           -- Metaculus question id, when the
+                                       -- forecast was submitted there
+    metaculus_url   TEXT               -- Metaculus post URL, for humans
 );
 """
 
@@ -53,17 +56,22 @@ class Ledger:
     def __init__(self, db_path: str):
         self.conn = sqlite3.connect(db_path)
         self.conn.execute(SCHEMA)
-        # Lightweight migration: databases created before the formalization
-        # pass (Phase 2) lack raw_question. ALTER TABLE is safe to gate on a
-        # column check and keeps old ledgers working without manual surgery.
+        # Lightweight migrations: databases created before Phase 2 lack
+        # raw_question; before Phase 3, the metaculus columns. ALTER TABLE
+        # gated on a column check keeps old ledgers working without surgery.
         cols = {
             row[1]
             for row in self.conn.execute("PRAGMA table_info(predictions)")
         }
-        if "raw_question" not in cols:
-            self.conn.execute(
-                "ALTER TABLE predictions ADD COLUMN raw_question TEXT"
-            )
+        for name, decl in (
+            ("raw_question", "TEXT"),
+            ("metaculus_qid", "INTEGER"),
+            ("metaculus_url", "TEXT"),
+        ):
+            if name not in cols:
+                self.conn.execute(
+                    f"ALTER TABLE predictions ADD COLUMN {name} {decl}"
+                )
         self.conn.commit()
 
     # --- writes ---------------------------------------------------------
@@ -73,12 +81,16 @@ class Ledger:
         q: Question,
         forecast: AggregatedForecast,
         raw_question: str | None = None,
+        metaculus_qid: int | None = None,
+        metaculus_url: str | None = None,
     ) -> int:
         """Log a fresh forecast; returns the prediction id.
 
         `raw_question` is the user's original phrasing when a formalization
         pass rewrote it — kept so the ledger always shows both what was asked
         and what was actually forecast. None when no rewrite happened.
+        The metaculus fields tie the row to a tournament question when the
+        forecast was submitted there.
         """
         # Keep the rationale from the run whose probability sits closest to
         # the median — it best represents the aggregate's "reasoning".
@@ -89,8 +101,9 @@ class Ledger:
         cur = self.conn.execute(
             """INSERT INTO predictions
                (question, raw_question, criteria, resolution_date,
-                probability, runs, spread, rationale, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                probability, runs, spread, rationale, created_at,
+                metaculus_qid, metaculus_url)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 q.text,
                 raw_question,
@@ -101,6 +114,8 @@ class Ledger:
                 forecast.spread,
                 rep.rationale,
                 datetime.now().isoformat(timespec="seconds"),
+                metaculus_qid,
+                metaculus_url,
             ),
         )
         self.conn.commit()

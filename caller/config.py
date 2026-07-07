@@ -38,6 +38,13 @@ class Config:
         default_factory=lambda: os.environ.get("CALLER_QUERY_MODEL", "claude-haiku-4-5")
     )
 
+    # --- Metaculus settings ---------------------------------------------------
+    # Bot-account API token from https://www.metaculus.com/aib/. Required only
+    # for the `metaculus` subcommand; everything else runs without it.
+    metaculus_token: str = field(
+        default_factory=lambda: os.environ.get("METACULUS_TOKEN", "")
+    )
+
     # --- Aggregation settings -----------------------------------------------
     # Number of independent reasoning runs per forecast. The literature
     # (Halawi et al. 2024) shows median-of-N reliably beats single runs;

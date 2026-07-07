@@ -23,7 +23,7 @@ import argparse
 import sys
 from datetime import date
 
-from . import aggregate, config, formalize, ledger, reasoning, research
+from . import aggregate, config, formalize, ledger, metaculus, reasoning, research
 from .question import Question
 
 
@@ -111,6 +111,98 @@ def cmd_forecast(args, cfg) -> None:
     print(f"\nRepresentative rationale:\n{rep.rationale}")
 
 
+def _forecast_one_metaculus(mq, args, cfg, book, client) -> None:
+    """Run the full pipeline on one Metaculus question; submit unless dry-run."""
+    q = mq.to_question()
+    print(f"\n=== {mq.title}\n    {mq.url}")
+
+    digest = research.gather(q, cfg, mock=args.mock)
+    print(f"Research digest assembled ({len(digest)} chars).")
+
+    runs = []
+    n = args.runs or cfg.default_runs
+    for i in range(n):
+        print(f"Reasoning run {i + 1}/{n}...", end=" ", flush=True)
+        if args.mock:
+            run = reasoning.run_once_mock(q, digest)
+        else:
+            run = reasoning.run_once(q, digest, cfg)
+        print(f"p = {run.probability:.2f}")
+        runs.append(run)
+
+    forecast = aggregate.aggregate(runs)
+    print(forecast.summary())
+    rep = min(runs, key=lambda r: abs(r.probability - forecast.probability))
+
+    if args.dry_run:
+        # No side effects at all: nothing submitted, nothing recorded. The
+        # point of a dry run is to inspect what *would* happen — recording
+        # test sweeps would pollute the calibration ledger.
+        print("DRY RUN — not submitted, not recorded.")
+        print(f"Would submit p = {forecast.probability:.2f} "
+              f"for question {mq.question_id}.")
+        print(f"Rationale:\n{rep.rationale}")
+        return
+
+    client.submit(mq.question_id, forecast.probability)
+    comment = (
+        f"caller bot — median of {len(runs)} independent runs "
+        f"(spread {forecast.spread:.2f}).\n\n{rep.rationale}"
+    )
+    client.post_comment(mq.post_id, comment)
+    pid = book.record(
+        q,
+        forecast,
+        metaculus_qid=mq.question_id,
+        metaculus_url=mq.url,
+    )
+    print(f"Submitted p = {forecast.probability:.2f} and rationale comment; "
+          f"logged as prediction #{pid}.")
+
+
+def _make_client(cfg) -> metaculus.MetaculusClient:
+    """Client factory — a seam so tests can stub the network side."""
+    return metaculus.MetaculusClient(cfg.metaculus_token)
+
+
+def cmd_metaculus(args, cfg) -> None:
+    # Mock reasoning must never reach a live tournament — a --mock sweep is
+    # for exercising plumbing, so it is forced into dry-run mode.
+    if args.mock and not args.dry_run:
+        print("--mock implies --dry-run (mock forecasts are never submitted).")
+        args.dry_run = True
+
+    client = _make_client(cfg)
+    questions = client.list_open_binary(args.tournament)
+
+    fresh = [q for q in questions if not q.already_forecasted]
+    skipped = len(questions) - len(fresh)
+    if skipped:
+        print(f"Skipping {skipped} question(s) already forecasted.")
+    if not fresh:
+        print(f"No open unforecasted binary questions in '{args.tournament}'.")
+        return
+    if args.limit and len(fresh) > args.limit:
+        print(f"Limiting to {args.limit} of {len(fresh)} open questions.")
+        fresh = fresh[: args.limit]
+
+    book = ledger.Ledger(cfg.db_path)
+    failures = []
+    for mq in fresh:
+        try:
+            _forecast_one_metaculus(mq, args, cfg, book, client)
+        except (ValueError, KeyError) as exc:
+            # One bad question (thin research, malformed model output, a
+            # rejected submission) must not abort the rest of the sweep.
+            print(f"FAILED on '{mq.title}': {exc}", file=sys.stderr)
+            failures.append(mq.title)
+
+    print(f"\nDone: {len(fresh) - len(failures)}/{len(fresh)} question(s) "
+          f"processed{' (dry run)' if args.dry_run else ''}.")
+    if failures:
+        print("Failed: " + "; ".join(failures), file=sys.stderr)
+
+
 def cmd_formalize(args, cfg) -> None:
     """Preview a formalization without forecasting — useful for sharpening a
     question (or checking whether it needs sharpening) before spending the
@@ -179,6 +271,26 @@ def main(argv: list[str] | None = None) -> None:
     p_fm.add_argument("--mock", action="store_true",
                       help="run offline with a canned formalization")
     p_fm.set_defaults(func=cmd_formalize)
+
+    p_mc = sub.add_parser(
+        "metaculus",
+        help="forecast open tournament questions and submit to Metaculus",
+    )
+    p_mc.add_argument(
+        "--tournament", default=metaculus.DEFAULT_TOURNAMENT,
+        help="tournament slug or id (default: %(default)s — the sandbox; "
+             "try 'minibench' or 33022 for live tournaments)")
+    p_mc.add_argument(
+        "--limit", type=int, default=5,
+        help="max questions to forecast this sweep (default: %(default)s; "
+             "each costs ~7 LLM calls + search)")
+    p_mc.add_argument("--runs", type=int,
+                      help="number of reasoning runs to aggregate")
+    p_mc.add_argument("--dry-run", action="store_true",
+                      help="run the pipeline but submit and record nothing")
+    p_mc.add_argument("--mock", action="store_true",
+                      help="offline research/reasoning (implies --dry-run)")
+    p_mc.set_defaults(func=cmd_metaculus)
 
     p_res = sub.add_parser("resolve", help="record a question's real-world outcome")
     p_res.add_argument("id", type=int, help="prediction id from the ledger")
