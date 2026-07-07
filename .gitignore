@@ -1,0 +1,16 @@
+# Secrets — never commit API keys
+.env
+
+# Virtual environment
+venv/
+
+# The prediction ledger is data, not code. It stays local (and gets a
+# mounted volume if this ever runs in Docker).
+caller.db
+
+# Python artifacts
+__pycache__/
+*.pyc
+.pytest_cache/
+.coverage
+htmlcov/
