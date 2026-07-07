@@ -25,6 +25,8 @@ path; the mapper below just reassembles those fields into our Question
 contract.
 """
 
+import sys
+import time
 from dataclasses import dataclass, field
 from datetime import date, datetime
 
@@ -33,6 +35,13 @@ import requests
 from .question import Question
 
 API_BASE_URL = "https://www.metaculus.com/api"
+
+# Metaculus sits behind Cloudflare and rate-limits rapid-fire requests (a
+# sweep's back-to-back dedup GETs triggered a 429, verified live). A small
+# gap between requests plus patient retries keeps a bot sweep under the
+# radar. Tests zero the throttle.
+THROTTLE_SECONDS = 0.7
+MAX_RETRIES_ON_429 = 4
 
 # Tournament slugs/ids worth knowing (from the official bot template):
 #   "bot-testing-area"  — sandbox for validating a bot end-to-end
@@ -99,6 +108,29 @@ class MetaculusClient:
             )
         self.headers = {"Authorization": f"Token {token}"}
 
+    def _request(self, method: str, url: str, **kwargs) -> requests.Response:
+        """All API traffic funnels through here: throttle + 429 backoff."""
+        resp = None
+        for attempt in range(MAX_RETRIES_ON_429 + 1):
+            time.sleep(THROTTLE_SECONDS)
+            resp = requests.request(
+                method, url, headers=self.headers, timeout=30, **kwargs
+            )
+            if resp.status_code != 429 or attempt == MAX_RETRIES_ON_429:
+                return resp
+            retry_after = resp.headers.get("Retry-After", "")
+            delay = (
+                int(retry_after)
+                if retry_after.isdigit()
+                else 15 * (attempt + 1)  # 15s, 30s, 45s, 60s
+            )
+            print(
+                f"Metaculus rate limit (429); retrying in {delay}s...",
+                file=sys.stderr,
+            )
+            time.sleep(delay)
+        return resp
+
     def _check(self, resp: requests.Response, context: str) -> None:
         # Same policy as the Tavily backend: surface the response body, since
         # that is where Metaculus puts the actual reason for a rejection.
@@ -114,9 +146,9 @@ class MetaculusClient:
         self, tournament: str | int, count: int = 50
     ) -> list[MetaculusQuestion]:
         """Open binary questions in a tournament, oldest-closing first."""
-        resp = requests.get(
+        resp = self._request(
+            "get",
             f"{API_BASE_URL}/posts/",
-            headers=self.headers,
             params={
                 "tournaments": [tournament],
                 "statuses": "open",
@@ -124,7 +156,6 @@ class MetaculusClient:
                 "limit": count,
                 "order_by": "-hotness",
             },
-            timeout=30,
         )
         self._check(resp, "question listing")
 
@@ -156,11 +187,7 @@ class MetaculusClient:
         populates it. So dedup requires one extra GET per candidate; the CLI
         checks lazily, only until its sweep limit is filled.
         """
-        resp = requests.get(
-            f"{API_BASE_URL}/posts/{post_id}/",
-            headers=self.headers,
-            timeout=30,
-        )
+        resp = self._request("get", f"{API_BASE_URL}/posts/{post_id}/")
         self._check(resp, f"detail fetch for post {post_id}")
         question = resp.json().get("question") or {}
         latest = (question.get("my_forecasts") or {}).get("latest") or {}
@@ -171,9 +198,9 @@ class MetaculusClient:
     def submit(self, question_id: int, probability: float) -> None:
         """Submit a binary forecast. The endpoint expects a JSON *array* —
         one entry per question — even for a single prediction."""
-        resp = requests.post(
+        resp = self._request(
+            "post",
             f"{API_BASE_URL}/questions/forecast/",
-            headers=self.headers,
             json=[
                 {
                     "question": question_id,
@@ -183,7 +210,6 @@ class MetaculusClient:
                     "continuous_cdf": None,
                 }
             ],
-            timeout=30,
         )
         self._check(resp, f"forecast submission for question {question_id}")
 
@@ -192,9 +218,9 @@ class MetaculusClient:
 
         Private keeps the bot's reasoning out of the public thread while
         still satisfying tournaments that expect submitted rationales."""
-        resp = requests.post(
+        resp = self._request(
+            "post",
             f"{API_BASE_URL}/comments/create/",
-            headers=self.headers,
             json={
                 "text": text,
                 "parent": None,
@@ -202,6 +228,5 @@ class MetaculusClient:
                 "is_private": True,
                 "on_post": post_id,
             },
-            timeout=30,
         )
         self._check(resp, f"comment on post {post_id}")

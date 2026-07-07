@@ -43,14 +43,27 @@ def _post(post_id=101, qid=201, forecasted=False, qtype="binary"):
 
 
 class FakeResponse:
-    def __init__(self, payload=None, ok=True, status_code=200, text=""):
+    def __init__(self, payload=None, ok=True, status_code=200, text="",
+                 headers=None):
         self._payload = payload or {}
         self.ok = ok
         self.status_code = status_code
         self.text = text
+        self.headers = headers or {}
 
     def json(self):
         return self._payload
+
+
+@pytest.fixture(autouse=True)
+def no_throttle(monkeypatch):
+    """Zero the politeness delay so tests don't sleep."""
+    monkeypatch.setattr(metaculus, "THROTTLE_SECONDS", 0)
+
+
+def _patch_request(monkeypatch, handler):
+    """Route the client's request funnel to a handler(method, url, **kw)."""
+    monkeypatch.setattr(metaculus.requests, "request", handler)
 
 
 # --- client construction and error surfacing ---------------------------
@@ -67,8 +80,8 @@ def test_client_sets_token_header():
 
 
 def test_error_surfaces_response_body(monkeypatch):
-    monkeypatch.setattr(
-        metaculus.requests, "get",
+    _patch_request(
+        monkeypatch,
         lambda *a, **k: FakeResponse(ok=False, status_code=403,
                                      text='{"detail":"Invalid token."}'),
     )
@@ -77,17 +90,45 @@ def test_error_surfaces_response_body(monkeypatch):
         client.list_open_binary("bot-testing-area")
 
 
+def test_retries_on_429_then_succeeds(monkeypatch):
+    """Rate limiting (verified live via Cloudflare 429) must retry, not die."""
+    monkeypatch.setattr(metaculus.time, "sleep", lambda s: None)
+    calls = {"n": 0}
+
+    def handler(method, url, **kwargs):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return FakeResponse(ok=False, status_code=429,
+                                headers={"Retry-After": "1"})
+        return FakeResponse({"results": [_post()]})
+
+    _patch_request(monkeypatch, handler)
+    questions = MetaculusClient("t").list_open_binary("minibench")
+    assert calls["n"] == 2
+    assert len(questions) == 1
+
+
+def test_gives_up_after_max_429_retries(monkeypatch):
+    monkeypatch.setattr(metaculus.time, "sleep", lambda s: None)
+    _patch_request(
+        monkeypatch,
+        lambda *a, **k: FakeResponse(ok=False, status_code=429, text="slow down"),
+    )
+    with pytest.raises(ValueError, match="429"):
+        MetaculusClient("t").list_open_binary("minibench")
+
+
 # --- listing and parsing ------------------------------------------------
 
 
 def test_list_open_binary_parses_posts(monkeypatch):
     captured = {}
 
-    def fake_get(url, headers=None, params=None, timeout=None):
+    def fake_request(method, url, params=None, **kwargs):
         captured["url"], captured["params"] = url, params
         return FakeResponse({"results": [_post(101, 201), _post(102, 202)]})
 
-    monkeypatch.setattr(metaculus.requests, "get", fake_get)
+    _patch_request(monkeypatch, fake_request)
     questions = MetaculusClient("t").list_open_binary("minibench")
 
     assert captured["url"] == f"{API_BASE_URL}/posts/"
@@ -100,8 +141,8 @@ def test_list_open_binary_parses_posts(monkeypatch):
 
 
 def test_list_flags_already_forecasted(monkeypatch):
-    monkeypatch.setattr(
-        metaculus.requests, "get",
+    _patch_request(
+        monkeypatch,
         lambda *a, **k: FakeResponse(
             {"results": [_post(101, 201, forecasted=True), _post(102, 202)]}
         ),
@@ -113,9 +154,8 @@ def test_list_flags_already_forecasted(monkeypatch):
 
 def test_list_filters_non_binary_defensively(monkeypatch):
     posts = [_post(101, 201), _post(102, 202, qtype="numeric"), {"id": 103}]
-    monkeypatch.setattr(
-        metaculus.requests, "get",
-        lambda *a, **k: FakeResponse({"results": posts}),
+    _patch_request(
+        monkeypatch, lambda *a, **k: FakeResponse({"results": posts})
     )
     questions = MetaculusClient("t").list_open_binary("minibench")
     assert [q.question_id for q in questions] == [201]
@@ -126,7 +166,7 @@ def test_already_forecasted_reads_post_detail(monkeypatch):
     forecast-state dedup must hit the per-post detail endpoint."""
     captured = {}
 
-    def fake_get(url, headers=None, params=None, timeout=None):
+    def fake_request(method, url, **kwargs):
         captured["url"] = url
         return FakeResponse({
             "id": 101,
@@ -136,14 +176,14 @@ def test_already_forecasted_reads_post_detail(monkeypatch):
             },
         })
 
-    monkeypatch.setattr(metaculus.requests, "get", fake_get)
+    _patch_request(monkeypatch, fake_request)
     assert MetaculusClient("t").already_forecasted(101) is True
     assert captured["url"] == f"{API_BASE_URL}/posts/101/"
 
 
 def test_already_forecasted_false_when_no_forecast(monkeypatch):
-    monkeypatch.setattr(
-        metaculus.requests, "get",
+    _patch_request(
+        monkeypatch,
         lambda *a, **k: FakeResponse(
             {"id": 101, "question": {"id": 201, "my_forecasts": None}}
         ),
@@ -157,11 +197,11 @@ def test_already_forecasted_false_when_no_forecast(monkeypatch):
 def test_submit_sends_array_payload(monkeypatch):
     captured = {}
 
-    def fake_post(url, headers=None, json=None, timeout=None):
+    def fake_request(method, url, json=None, **kwargs):
         captured["url"], captured["json"] = url, json
         return FakeResponse()
 
-    monkeypatch.setattr(metaculus.requests, "post", fake_post)
+    _patch_request(monkeypatch, fake_request)
     MetaculusClient("t").submit(201, 0.42)
 
     assert captured["url"] == f"{API_BASE_URL}/questions/forecast/"
@@ -177,11 +217,11 @@ def test_submit_sends_array_payload(monkeypatch):
 def test_post_comment_is_private_on_post(monkeypatch):
     captured = {}
 
-    def fake_post(url, headers=None, json=None, timeout=None):
+    def fake_request(method, url, json=None, **kwargs):
         captured["url"], captured["json"] = url, json
         return FakeResponse()
 
-    monkeypatch.setattr(metaculus.requests, "post", fake_post)
+    _patch_request(monkeypatch, fake_request)
     MetaculusClient("t").post_comment(101, "rationale text")
 
     assert captured["url"] == f"{API_BASE_URL}/comments/create/"
