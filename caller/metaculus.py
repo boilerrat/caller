@@ -193,6 +193,20 @@ class MetaculusClient:
         latest = (question.get("my_forecasts") or {}).get("latest") or {}
         return bool(latest.get("forecast_values"))
 
+    def resolution(self, post_id: int) -> str | None:
+        """The question's resolution, once Metaculus has resolved it.
+
+        Returns 'yes' or 'no' for scored resolutions, 'annulled' or
+        'ambiguous' when Metaculus voided the question (those should not be
+        Brier-scored), and None while the question remains unresolved.
+        """
+        resp = self._request("get", f"{API_BASE_URL}/posts/{post_id}/")
+        self._check(resp, f"detail fetch for post {post_id}")
+        question = resp.json().get("question") or {}
+        if question.get("status") != "resolved":
+            return None
+        return question.get("resolution")
+
     # --- writes -----------------------------------------------------------
 
     def submit(self, question_id: int, probability: float) -> None:

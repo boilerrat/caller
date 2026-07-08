@@ -70,5 +70,11 @@ guarantee). Dev deps in `requirements-dev.txt`.
 
 - No git repository yet — this is a plain directory, not `git init`'d (a `.gitignore` already exists, covering `venv/`, `.env`, `caller.db`, caches). When it becomes one, switch to the issue-first workflow.
 - No Docker or deployment configuration — deliberately (user's call), it runs locally.
-- No cron job is actually installed yet — only documented in the README.
 - Ledger row #14 is the sandbox (bot-testing-area) test submission — a real question resolving 2027-01-31, kept unless the user wants it removed. Mock rows were cleaned 2026-07-06.
+
+## Live operations (as of 2026-07-07)
+
+- **The bot is live**: ledger #15–32 are real submissions to the Metaculus Cup Summer 2026 (`metaculus-cup-summer-2026`), all 18 open binary questions, submitted with private rationale comments.
+- **Cron is installed** in the user's crontab: sweeps every 6 hours, staggered — Cup at :00, `minibench` at :20, AI Benchmarking (`33022`) at :40 — each `--limit 5`, logging to `metaculus_cron.log` (gitignored). MiniBench and AIB were between question batches at install time; cron picks up new batches automatically.
+- **Metaculus rate-limits** rapid requests via Cloudflare (429) — the client throttles (0.7s between requests) and retries with backoff. Don't remove that.
+- **Auto-resolution is live**: `python -m caller sync` (cron: daily at 05:10) checks every open Metaculus-linked ledger row against the question's resolution state (`client.resolution(post_id)`: 'yes'/'no' → Brier-scored via `book.resolve()`; 'annulled'/'ambiguous' → reported, never scored; None → still open). `Ledger.open_metaculus_rows()` supplies the candidates; the post id is parsed from the stored `metaculus_url`. Manual `resolve` remains for local-only (non-Metaculus) predictions.

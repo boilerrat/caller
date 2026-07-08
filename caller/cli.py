@@ -213,6 +213,43 @@ def cmd_metaculus(args, cfg) -> None:
         print("Failed: " + "; ".join(failures), file=sys.stderr)
 
 
+def cmd_sync(args, cfg) -> None:
+    """Pull resolutions from Metaculus and Brier-score the settled ones.
+
+    This closes the calibration loop for tournament forecasts without any
+    manual `resolve` calls: any open prediction with a Metaculus link gets
+    checked against the question's current resolution state. Annulled and
+    ambiguous resolutions are reported but never scored — Metaculus voided
+    the question, so it carries no calibration signal.
+    """
+    book = ledger.Ledger(cfg.db_path)
+    rows = book.open_metaculus_rows()
+    if not rows:
+        print("No open Metaculus-linked predictions to sync.")
+        return
+
+    client = _make_client(cfg)
+    resolved = voided = 0
+    for pid, url in rows:
+        post_id = int(url.rstrip("/").rsplit("/", 1)[-1])
+        res = client.resolution(post_id)
+        if res is None:
+            continue
+        if res in ("yes", "no"):
+            brier = book.resolve(pid, outcome_yes=(res == "yes"))
+            print(f"#{pid} resolved {res.upper()} — Brier {brier:.4f}")
+            resolved += 1
+        else:
+            print(f"#{pid} resolved '{res}' on Metaculus — not scored.")
+            voided += 1
+
+    still_open = len(rows) - resolved - voided
+    print(f"Sync done: {resolved} scored, {voided} voided, "
+          f"{still_open} still open.")
+    if resolved:
+        print("\n" + book.calibration_summary())
+
+
 def cmd_formalize(args, cfg) -> None:
     """Preview a formalization without forecasting — useful for sharpening a
     question (or checking whether it needs sharpening) before spending the
@@ -301,6 +338,12 @@ def main(argv: list[str] | None = None) -> None:
     p_mc.add_argument("--mock", action="store_true",
                       help="offline research/reasoning (implies --dry-run)")
     p_mc.set_defaults(func=cmd_metaculus)
+
+    p_sync = sub.add_parser(
+        "sync",
+        help="pull resolutions from Metaculus and Brier-score settled questions",
+    )
+    p_sync.set_defaults(func=cmd_sync)
 
     p_res = sub.add_parser("resolve", help="record a question's real-world outcome")
     p_res.add_argument("id", type=int, help="prediction id from the ledger")

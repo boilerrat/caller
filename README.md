@@ -109,13 +109,26 @@ call, ~6 searches, and N reasoning runs. `--mock` exercises the plumbing
 offline and always implies `--dry-run`: a mock forecast can never reach a
 live tournament.
 
-To forecast on a schedule, a crontab entry is all it takes (no
+When Metaculus resolves the questions, `sync` pulls the outcomes and
+Brier-scores them — the calibration loop closes without any manual
+`resolve` calls. Annulled and ambiguous resolutions are reported but never
+scored, since a voided question carries no calibration signal.
+
+```bash
+python -m caller sync
+```
+
+To forecast and score on a schedule, crontab entries are all it takes (no
 containerization needed while running on one machine):
 
 ```cron
-# Sweep MiniBench four times a day, keeping a log:
+# Sweep MiniBench four times a day, and score resolutions daily:
 0 */6 * * * cd /path/to/caller && set -a; . ./.env; set +a; venv/bin/python -m caller metaculus --tournament minibench --limit 5 >> metaculus_cron.log 2>&1
+10 5 * * * cd /path/to/caller && set -a; . ./.env; set +a; venv/bin/python -m caller sync >> metaculus_cron.log 2>&1
 ```
+
+The client throttles its requests and backs off on HTTP 429 — Metaculus
+rate-limits rapid-fire API traffic, and a patient bot is a welcome bot.
 
 ## Architecture
 

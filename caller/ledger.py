@@ -147,6 +147,16 @@ class Ledger:
         )
         return [LedgerRow(*r) for r in cur.fetchall()]
 
+    def open_metaculus_rows(self) -> list[tuple[int, str]]:
+        """(prediction id, metaculus_url) for every unresolved prediction
+        that was submitted to Metaculus — the sync candidates."""
+        cur = self.conn.execute(
+            """SELECT id, metaculus_url FROM predictions
+               WHERE outcome IS NULL AND metaculus_url IS NOT NULL
+               ORDER BY id"""
+        )
+        return cur.fetchall()
+
     def calibration_summary(self) -> str:
         rows = self.rows()
         resolved = [r for r in rows if r.brier is not None]

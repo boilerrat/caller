@@ -191,6 +191,36 @@ def test_already_forecasted_false_when_no_forecast(monkeypatch):
     assert MetaculusClient("t").already_forecasted(101) is False
 
 
+def test_resolution_returns_none_while_open(monkeypatch):
+    _patch_request(
+        monkeypatch,
+        lambda *a, **k: FakeResponse(
+            {"question": {"status": "open", "resolution": None}}
+        ),
+    )
+    assert MetaculusClient("t").resolution(101) is None
+
+
+def test_resolution_returns_outcome_when_resolved(monkeypatch):
+    _patch_request(
+        monkeypatch,
+        lambda *a, **k: FakeResponse(
+            {"question": {"status": "resolved", "resolution": "yes"}}
+        ),
+    )
+    assert MetaculusClient("t").resolution(101) == "yes"
+
+
+def test_resolution_passes_through_annulled(monkeypatch):
+    _patch_request(
+        monkeypatch,
+        lambda *a, **k: FakeResponse(
+            {"question": {"status": "resolved", "resolution": "annulled"}}
+        ),
+    )
+    assert MetaculusClient("t").resolution(101) == "annulled"
+
+
 # --- submission payloads ------------------------------------------------
 
 
@@ -272,10 +302,14 @@ def test_url_derived_from_post_id():
 
 
 class StubClient:
-    def __init__(self, questions):
+    def __init__(self, questions, resolutions=None):
         self.questions = questions
         self.submitted = []
         self.comments = []
+        self.resolutions = resolutions or {}  # post_id -> resolution str
+
+    def resolution(self, post_id):
+        return self.resolutions.get(post_id)
 
     def list_open_binary(self, tournament, count=50):
         return self.questions
@@ -404,6 +438,76 @@ def test_metaculus_sweep_continues_after_one_failure(cli_db, monkeypatch, capsys
     captured = capsys.readouterr()
     assert "FAILED on" in captured.err
     assert "1/2 question(s) processed" in captured.out
+
+
+def _record_metaculus_row(db_path, post_id, qid, probability):
+    """Insert a Metaculus-linked prediction directly via the Ledger."""
+    from datetime import date
+    from caller.aggregate import aggregate
+    from caller.ledger import Ledger
+    from caller.question import Question
+    from caller.reasoning import ForecastRun
+
+    book = Ledger(db_path)
+    return book.record(
+        Question(text=f"q{qid}", resolution_date=date(2026, 12, 31)),
+        aggregate([ForecastRun(probability=probability, rationale="r")]),
+        metaculus_qid=qid,
+        metaculus_url=f"https://www.metaculus.com/questions/{post_id}/",
+    )
+
+
+def test_sync_scores_resolved_questions(cli_db, monkeypatch, capsys):
+    import os
+    db = os.environ["CALLER_DB"]
+    _record_metaculus_row(db, post_id=100, qid=200, probability=0.9)   # → YES
+    _record_metaculus_row(db, post_id=101, qid=201, probability=0.2)   # → NO
+    _record_metaculus_row(db, post_id=102, qid=202, probability=0.5)   # open
+    _record_metaculus_row(db, post_id=103, qid=203, probability=0.5)   # annulled
+
+    stub = StubClient([], resolutions={100: "yes", 101: "no", 103: "annulled"})
+    monkeypatch.setattr("caller.cli._make_client", lambda cfg: stub)
+
+    main(["sync"])
+    out = capsys.readouterr().out
+    assert "#1 resolved YES — Brier 0.0100" in out    # (0.9-1)^2
+    assert "#2 resolved NO — Brier 0.0400" in out     # (0.2-0)^2
+    assert "'annulled' on Metaculus — not scored" in out
+    assert "Sync done: 2 scored, 1 voided, 1 still open." in out
+    assert "Mean Brier score:  0.0250" in out
+
+    # A second sync finds only the still-open and annulled rows.
+    main(["sync"])
+    out = capsys.readouterr().out
+    assert "Sync done: 0 scored" in out
+
+
+def test_sync_with_nothing_to_do(cli_db, capsys):
+    main(["sync"])
+    assert "No open Metaculus-linked predictions" in capsys.readouterr().out
+
+
+def test_open_metaculus_rows_excludes_local_only_predictions(tmp_path):
+    from datetime import date
+    from caller.aggregate import aggregate
+    from caller.ledger import Ledger
+    from caller.question import Question
+    from caller.reasoning import ForecastRun
+
+    db = str(tmp_path / "l.db")
+    book = Ledger(db)
+    # Local-only prediction: no metaculus linkage → never a sync candidate.
+    book.record(
+        Question(text="local", resolution_date=date(2026, 12, 31)),
+        aggregate([ForecastRun(probability=0.5, rationale="r")]),
+    )
+    pid = _record_metaculus_row(db, post_id=100, qid=200, probability=0.5)
+    assert book.open_metaculus_rows() == [
+        (pid, "https://www.metaculus.com/questions/100/")
+    ]
+    # Once resolved, it drops out of the candidate list.
+    book.resolve(pid, outcome_yes=True)
+    assert book.open_metaculus_rows() == []
 
 
 def test_metaculus_migration_adds_columns_to_phase2_db(tmp_path):
