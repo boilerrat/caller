@@ -15,7 +15,7 @@ Mock mode (`--mock`) runs the full pipeline offline with no keys.
 ## Installation
 
 ```bash
-git clone https://github.com/boilerrat/caller
+git clone ([https://github.com/boilerrat/caller](https://github.com/boilerrat/caller))
 cd caller
 pip install -r requirements.txt
 cp .env.example .env    # then fill in your keys
